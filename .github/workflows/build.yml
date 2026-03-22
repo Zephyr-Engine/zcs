@@ -1,0 +1,19 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: jackpar/zig:0.16.0-dev.2694
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build project
+      run: zig build test --summary all
