@@ -2,7 +2,7 @@
 
 An archetype-based Entity Component System for Zig 0.16, with SoA memory layout and comptime query validation.
 
-Designed for the [Zephyr Game Engine](https://github.com/Zephyr-Engine/zephyr) but fully standalone — usable in any Zig project that needs high-performance ECS.
+Designed for the [Zephyr Game Engine](https://github.com/Zephyr-Engine) but fully standalone — usable in any Zig project that needs high-performance ECS.
 
 ## Features
 
