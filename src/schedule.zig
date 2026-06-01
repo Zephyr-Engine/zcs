@@ -1,6 +1,7 @@
 const std = @import("std");
 const world_mod = @import("world.zig");
 const cmd_mod = @import("command_buffer.zig");
+const resources_mod = @import("resources.zig");
 
 /// Returns a Schedule type specialized for the given Registry.
 pub fn Schedule(comptime Reg: type) type {
@@ -21,6 +22,7 @@ pub fn Schedule(comptime Reg: type) type {
         /// Run a full tick: execute all phases in order, flushing the
         /// CommandBuffer between each phase.
         pub fn tick(world: *SchedWorldType, cmd: *SchedCmdBufType, comptime spec: Spec) !void {
+            world.advanceTick();
             inline for (spec.pre_update) |sys| try sys(world, cmd);
             try cmd.flush();
 
@@ -32,6 +34,19 @@ pub fn Schedule(comptime Reg: type) type {
 
             inline for (spec.render) |sys| try sys(world, cmd);
             try cmd.flush();
+        }
+
+        /// Like `tick`, but first publishes the frame's delta time as the
+        /// standard `DeltaTime` resource and increments `FrameCount`, so
+        /// systems can read them via `world.getResource(...)`.
+        pub fn tickDt(world: *SchedWorldType, cmd: *SchedCmdBufType, dt: f32, comptime spec: Spec) !void {
+            try world.setResource(resources_mod.DeltaTime, .{ .seconds = dt });
+            if (world.getResourceOrNull(resources_mod.FrameCount)) |fc| {
+                fc.value += 1;
+            } else {
+                try world.setResource(resources_mod.FrameCount, .{ .value = 1 });
+            }
+            try tick(world, cmd, spec);
         }
     };
 }
@@ -86,6 +101,35 @@ test "Schedule tick runs systems" {
     const pos = world.getComponent(e, TestPos).?;
     try std.testing.expectApproxEqAbs(1.0, pos.x, 0.001);
     try std.testing.expectApproxEqAbs(2.0, pos.y, 0.001);
+}
+
+fn dtMovementSystem(world: *WorldType, _: *CmdBufType) !void {
+    const dt = world.getResource(resources_mod.DeltaTime).seconds;
+    var iter = world.query(.{ .write = &.{TestPos}, .read = &.{TestVel} });
+    while (iter.next()) |view| {
+        for (view.write(TestPos), view.read(TestVel)) |*pos, vel| {
+            pos.x += vel.vx * dt;
+            pos.y += vel.vy * dt;
+        }
+    }
+}
+
+test "Schedule tickDt publishes DeltaTime and FrameCount" {
+    var world = WorldType.init(std.testing.allocator);
+    defer world.deinit();
+
+    var cmd = CmdBufType.init(&world);
+    defer cmd.deinit();
+
+    const e = try world.spawnWith(.{ TestPos{ .x = 0, .y = 0 }, TestVel{ .vx = 10, .vy = 0 } });
+
+    try SchedType.tickDt(&world, &cmd, 0.5, .{ .update = &.{dtMovementSystem} });
+    try std.testing.expectApproxEqAbs(5.0, world.getComponent(e, TestPos).?.x, 0.001);
+    try std.testing.expectEqual(1, world.getResource(resources_mod.FrameCount).value);
+
+    try SchedType.tickDt(&world, &cmd, 0.5, .{ .update = &.{dtMovementSystem} });
+    try std.testing.expectApproxEqAbs(10.0, world.getComponent(e, TestPos).?.x, 0.001);
+    try std.testing.expectEqual(2, world.getResource(resources_mod.FrameCount).value);
 }
 
 test "Schedule phase ordering" {

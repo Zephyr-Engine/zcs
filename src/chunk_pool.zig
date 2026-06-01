@@ -38,19 +38,24 @@ pub const ChunkPool = struct {
             return chunk;
         }
         const chunk = try self.allocator.create(Chunk);
+        errdefer self.allocator.destroy(chunk);
         chunk.* = .{};
         try self.allocated.append(self.allocator, chunk);
+        // Keep the free list able to hold every live chunk, so `free` is
+        // allocation-free and can never drop a chunk back into a leak.
+        try self.free_list.ensureTotalCapacity(self.allocator, self.allocated.items.len);
         return chunk;
     }
 
     pub fn free(self: *ChunkPool, chunk: *Chunk) void {
         chunk.count = 0;
-        self.free_list.append(self.allocator, chunk) catch {};
+        self.free_list.appendAssumeCapacity(chunk);
     }
 
     pub fn preWarm(self: *ChunkPool, count: usize) !void {
-        try self.free_list.ensureTotalCapacity(self.allocator, count);
-        try self.allocated.ensureTotalCapacity(self.allocator, self.allocated.items.len + count);
+        const target = self.allocated.items.len + count;
+        try self.free_list.ensureTotalCapacity(self.allocator, target);
+        try self.allocated.ensureTotalCapacity(self.allocator, target);
         for (0..count) |_| {
             const chunk = try self.allocator.create(Chunk);
             chunk.* = .{};

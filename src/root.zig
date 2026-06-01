@@ -6,7 +6,10 @@ pub const ChunkPool = @import("chunk_pool.zig").ChunkPool;
 pub const Chunk = @import("chunk_pool.zig").Chunk;
 pub const chunk_data_size = @import("chunk_pool.zig").chunk_data_size;
 pub const Resources = @import("resources.zig").Resources;
+pub const DeltaTime = @import("resources.zig").DeltaTime;
+pub const FrameCount = @import("resources.zig").FrameCount;
 pub const QuerySpec = @import("query.zig").QuerySpec;
+pub const ThreadPool = @import("parallel.zig").ThreadPool;
 
 pub fn SparseSet(comptime V: type) type {
     return @import("sparse_set.zig").SparseSet(V);
@@ -22,6 +25,20 @@ pub fn SparseSet(comptime V: type) type {
 /// ```
 pub fn Registry(comptime component_types: []const type) type {
     const count = component_types.len;
+
+    // Reject any single component that cannot fit in a chunk alongside an
+    // entity row. The archetype layout shrinks capacity to fit the combined
+    // stride of a mask, but a single oversized component is unrecoverable and
+    // would otherwise corrupt the heap at runtime.
+    comptime {
+        const EID = @import("entity.zig").EntityID;
+        for (component_types) |T| {
+            if (@sizeOf(EID) + @sizeOf(T) > chunk_data_size) {
+                @compileError("Component " ++ @typeName(T) ++ " is too large to fit in a " ++
+                    std.fmt.comptimePrint("{d}", .{chunk_data_size}) ++ "-byte chunk");
+            }
+        }
+    }
 
     return struct {
         pub const component_count = count;
@@ -76,6 +93,7 @@ pub fn Registry(comptime component_types: []const type) type {
         pub const Schedule = @import("schedule.zig").Schedule(@This());
         pub const Events = @import("events.zig").Events(@This());
         pub const Parallel = @import("parallel.zig").Parallel(@This());
+        pub const Serialize = @import("serialize.zig").Serializer(@This());
     };
 }
 
@@ -91,6 +109,7 @@ test {
     _ = @import("events.zig");
     _ = @import("parallel.zig");
     _ = @import("sparse_set.zig");
+    _ = @import("serialize.zig");
     std.testing.refAllDecls(@This());
 }
 

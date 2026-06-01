@@ -43,10 +43,16 @@ pub const EntityPool = struct {
 
     pub fn initCapacity(allocator: Allocator, capacity: u24) !EntityPool {
         const gens = try allocator.alloc(u8, capacity);
+        errdefer allocator.free(gens);
         @memset(gens, 0);
+        var free_list: std.ArrayListUnmanaged(u24) = .empty;
+        // Reserve so `destroy` never needs to allocate (and can't silently drop
+        // a recycled index): the free list never exceeds `generations.len`.
+        errdefer free_list.deinit(allocator);
+        try free_list.ensureTotalCapacity(allocator, capacity);
         return .{
             .generations = gens,
-            .free_list = .empty,
+            .free_list = free_list,
             .alive_count = 0,
             .len = 0,
             .allocator = allocator,
@@ -80,18 +86,36 @@ pub const EntityPool = struct {
                 self.allocator.free(self.generations);
             }
             self.generations = new_gens;
+            // Keep the free list able to hold every index, so `destroy` is
+            // allocation-free and can never drop a recycled index.
+            try self.free_list.ensureTotalCapacity(self.allocator, new_cap_clamped);
         }
 
         self.len = index + 1;
         self.alive_count += 1;
-        return .{ .index = index, .generation = 0 };
+        // Read the slot's generation rather than assuming 0: a never-used slot
+        // is 0 (memset), but after `clear()` reused slots carry a bumped
+        // generation so stale handles stay invalid.
+        return .{ .index = index, .generation = self.generations[index] };
     }
 
     pub fn destroy(self: *EntityPool, id: EntityID) void {
         if (!self.isAlive(id)) return;
         self.generations[id.index] +%= 1;
-        self.free_list.append(self.allocator, id.index) catch {};
+        // Capacity was reserved when the index was created, so this never
+        // allocates and never drops the index.
+        self.free_list.appendAssumeCapacity(id.index);
         self.alive_count -= 1;
+    }
+
+    /// Reset the pool to empty, retaining the generations allocation. Every
+    /// live index's generation is bumped so previously-issued handles remain
+    /// invalid and cannot collide with reused indices.
+    pub fn clear(self: *EntityPool) void {
+        for (self.generations[0..self.len]) |*g| g.* +%= 1;
+        self.len = 0;
+        self.alive_count = 0;
+        self.free_list.clearRetainingCapacity();
     }
 
     pub fn isAlive(self: *const EntityPool, id: EntityID) bool {
@@ -163,6 +187,42 @@ test "EntityPool initCapacity" {
     const e = try pool.create();
     try testing.expect(pool.isAlive(e));
     try testing.expectEqual(100, pool.generations.len);
+}
+
+test "EntityPool clear bumps generations and invalidates handles" {
+    var pool = EntityPool.init(testing.allocator);
+    defer pool.deinit();
+
+    const e0 = try pool.create();
+    const e1 = try pool.create();
+    try testing.expectEqual(2, pool.alive_count);
+
+    pool.clear();
+    try testing.expectEqual(0, pool.alive_count);
+    try testing.expect(!pool.isAlive(e0));
+    try testing.expect(!pool.isAlive(e1));
+
+    // Reused index 0 must not collide with the old handle.
+    const reused = try pool.create();
+    try testing.expectEqual(e0.index, reused.index);
+    try testing.expect(!reused.eql(e0));
+}
+
+test "EntityPool destroy is allocation-free under many recycles" {
+    var pool = EntityPool.init(testing.allocator);
+    defer pool.deinit();
+
+    // Create and destroy repeatedly; destroy must never drop an index, so the
+    // free list always has the recycled index available.
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const e = try pool.create();
+        pool.destroy(e);
+    }
+    try testing.expectEqual(0, pool.alive_count);
+    // Exactly one index was used and recycled each time.
+    const e = try pool.create();
+    try testing.expectEqual(0, e.index);
 }
 
 test "EntityPool generation wraparound" {

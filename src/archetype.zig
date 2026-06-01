@@ -20,23 +20,45 @@ pub fn Archetype(comptime Reg: type) type {
             row: u16,
         };
 
+        /// Per-component write tick for one chunk (change detection).
+        pub const ChangeTicks = [component_count]u64;
+
         mask: ComponentMask,
         chunks: std.ArrayListUnmanaged(*Chunk),
+        /// Parallel to `chunks`: change_ticks[i] holds the last-write tick of
+        /// each component column in chunks[i].
+        change_ticks: std.ArrayListUnmanaged(ChangeTicks),
         entity_count: u32,
         column_offsets: [component_count]u32,
         capacity: u16,
+        /// Ids of this archetype's present non-ZST components, packed so move
+        /// and swap-remove loops touch only real columns (not every slot in a
+        /// large registry).
+        present: [component_count]u16,
+        present_count: u16,
         add_edges: [component_count]?*Self,
         remove_edges: [component_count]?*Self,
         pool: *ChunkPool,
 
         pub fn init(mask: ComponentMask, pool: *ChunkPool) Self {
             const layout = computeLayout(mask);
+            var present: [component_count]u16 = undefined;
+            var present_count: u16 = 0;
+            for (0..component_count) |i| {
+                if (mask.isSet(i) and Reg.component_sizes[i] > 0) {
+                    present[present_count] = @intCast(i);
+                    present_count += 1;
+                }
+            }
             return .{
                 .mask = mask,
                 .chunks = .empty,
+                .change_ticks = .empty,
                 .entity_count = 0,
                 .column_offsets = layout.offsets,
                 .capacity = layout.capacity,
+                .present = present,
+                .present_count = present_count,
                 .add_edges = .{null} ** component_count,
                 .remove_edges = .{null} ** component_count,
                 .pool = pool,
@@ -45,34 +67,54 @@ pub fn Archetype(comptime Reg: type) type {
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.chunks.deinit(allocator);
+            self.change_ticks.deinit(allocator);
+        }
+
+        /// Pointer to the per-component change ticks for chunk `chunk_idx`.
+        pub fn chunkChangeTicks(self: *Self, chunk_idx: usize) *ChangeTicks {
+            return &self.change_ticks.items[chunk_idx];
+        }
+
+        /// Returns the total chunk bytes consumed by a layout of `capacity`
+        /// rows for `mask`, or null if it does not fit in a chunk.
+        fn layoutBytes(mask: ComponentMask, capacity: u16) ?usize {
+            var offset: usize = @as(usize, capacity) * @sizeOf(EntityID);
+            for (0..component_count) |i| {
+                if (mask.isSet(i) and Reg.component_sizes[i] > 0) {
+                    offset = std.mem.alignForward(usize, offset, Reg.component_aligns[i]);
+                    offset += @as(usize, capacity) * Reg.component_sizes[i];
+                }
+            }
+            if (offset > chunk_data_size) return null;
+            return offset;
         }
 
         /// Compute the SoA layout for a given component mask.
         /// Returns capacity (entities per chunk) and column offsets.
         fn computeLayout(mask: ComponentMask) struct { capacity: u16, offsets: [component_count]u32 } {
-            // Compute per-entity stride
+            // Compute per-entity stride (always at least one EntityID).
             var stride: usize = @sizeOf(EntityID);
             for (0..component_count) |i| {
                 if (mask.isSet(i) and Reg.component_sizes[i] > 0) {
                     stride += Reg.component_sizes[i];
                 }
             }
-            if (stride == 0) stride = @sizeOf(EntityID);
 
-            // Estimate capacity
-            var capacity: u16 = @intCast(@min(chunk_data_size / stride, std.math.maxInt(u16)));
+            // Estimate capacity, never below 1 so we always make progress.
+            var capacity: u16 = @intCast(@min(@max(chunk_data_size / stride, 1), std.math.maxInt(u16)));
 
-            // Refine: compute exact layout and verify it fits
+            // Refine: shrink until the exact aligned layout fits.
             while (capacity > 1) {
-                var offset: usize = @as(usize, capacity) * @sizeOf(EntityID);
-                for (0..component_count) |i| {
-                    if (mask.isSet(i) and Reg.component_sizes[i] > 0) {
-                        offset = std.mem.alignForward(usize, offset, Reg.component_aligns[i]);
-                        offset += @as(usize, capacity) * Reg.component_sizes[i];
-                    }
-                }
-                if (offset <= chunk_data_size) break;
+                if (layoutBytes(mask, capacity) != null) break;
                 capacity -= 1;
+            }
+
+            // Even a single row must fit. If it does not, this archetype's
+            // components are collectively larger than a chunk — an
+            // unrecoverable misconfiguration (Registry already rejects any
+            // single component that is too large at comptime).
+            if (layoutBytes(mask, capacity) == null) {
+                @panic("zcs: archetype row stride exceeds chunk_data_size; reduce component sizes or raise chunk_data_size");
             }
 
             // Compute final offsets
@@ -95,8 +137,13 @@ pub fn Archetype(comptime Reg: type) type {
             if (self.chunks.items.len == 0 or
                 self.chunks.items[self.chunks.items.len - 1].count >= self.capacity)
             {
+                // Reserve both lists first so chunk/tick storage stays in
+                // lockstep even on allocation failure.
+                try self.chunks.ensureUnusedCapacity(allocator, 1);
+                try self.change_ticks.ensureUnusedCapacity(allocator, 1);
                 const chunk = try self.pool.alloc();
-                try self.chunks.append(allocator, chunk);
+                self.chunks.appendAssumeCapacity(chunk);
+                self.change_ticks.appendAssumeCapacity(.{0} ** component_count);
             }
 
             const chunk_idx: u32 = @intCast(self.chunks.items.len - 1);
@@ -129,17 +176,13 @@ pub fn Archetype(comptime Reg: type) type {
                 moved_entity = last_entity_col[last_row];
                 entity_col[row] = last_entity_col[last_row];
 
-                // Swap component data
-                for (0..component_count) |comp_id| {
-                    if (self.mask.isSet(comp_id)) {
-                        const size = Reg.component_sizes[comp_id];
-                        if (size > 0) {
-                            const offset = self.column_offsets[comp_id];
-                            const dst = chunk.data[offset + @as(usize, row) * size ..][0..size];
-                            const src = last_chunk.data[offset + @as(usize, last_row) * size ..][0..size];
-                            @memcpy(dst, src);
-                        }
-                    }
+                // Swap component data (present non-ZST columns only)
+                for (self.present[0..self.present_count]) |comp_id| {
+                    const size = Reg.component_sizes[comp_id];
+                    const offset = self.column_offsets[comp_id];
+                    const dst = chunk.data[offset + @as(usize, row) * size ..][0..size];
+                    const src = last_chunk.data[offset + @as(usize, last_row) * size ..][0..size];
+                    @memcpy(dst, src);
                 }
             }
 
@@ -149,6 +192,7 @@ pub fn Archetype(comptime Reg: type) type {
             // Recycle empty last chunk
             if (last_chunk.count == 0) {
                 _ = self.chunks.pop();
+                _ = self.change_ticks.pop();
                 self.pool.free(last_chunk);
             }
 
@@ -199,17 +243,15 @@ pub fn Archetype(comptime Reg: type) type {
             dst_chunk: *Chunk,
             dst_row: u16,
         ) void {
-            for (0..component_count) |comp_id| {
-                if (src_arch.mask.isSet(comp_id) and dst_arch.mask.isSet(comp_id)) {
+            for (src_arch.present[0..src_arch.present_count]) |comp_id| {
+                if (dst_arch.mask.isSet(comp_id)) {
                     const size = Reg.component_sizes[comp_id];
-                    if (size > 0) {
-                        const src_off = src_arch.column_offsets[comp_id] + @as(u32, src_row) * @as(u32, @intCast(size));
-                        const dst_off = dst_arch.column_offsets[comp_id] + @as(u32, dst_row) * @as(u32, @intCast(size));
-                        @memcpy(
-                            dst_chunk.data[dst_off..][0..size],
-                            src_chunk.data[src_off..][0..size],
-                        );
-                    }
+                    const src_off = src_arch.column_offsets[comp_id] + @as(u32, src_row) * @as(u32, @intCast(size));
+                    const dst_off = dst_arch.column_offsets[comp_id] + @as(u32, dst_row) * @as(u32, @intCast(size));
+                    @memcpy(
+                        dst_chunk.data[dst_off..][0..size],
+                        src_chunk.data[src_off..][0..size],
+                    );
                 }
             }
         }
@@ -229,6 +271,7 @@ pub fn Archetype(comptime Reg: type) type {
                 self.pool.free(chunk);
             }
             self.chunks.clearRetainingCapacity();
+            self.change_ticks.clearRetainingCapacity();
             self.entity_count = 0;
         }
     };
@@ -326,6 +369,48 @@ test "Archetype swap-remove" {
 
     // e2's data should now be at row 0
     try std.testing.expectApproxEqAbs(2.0, arch.getColumn(chunk, TestPos)[0].x, 0.001);
+}
+
+const TestBig = struct { blob: [10000]u8 };
+
+const TestBigRegistry = struct {
+    pub const component_count = 1;
+    pub const ComponentMask = std.bit_set.IntegerBitSet(1);
+    pub const component_sizes: [1]usize = .{@sizeOf(TestBig)};
+    pub const component_aligns: [1]usize = .{@alignOf(TestBig)};
+
+    pub fn id(comptime T: type) comptime_int {
+        if (T == TestBig) return 0;
+        @compileError("unknown type");
+    }
+};
+
+test "Archetype large component clamps capacity and stays in bounds" {
+    var pool = ChunkPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    var mask = TestBigRegistry.ComponentMask.initEmpty();
+    mask.set(0);
+
+    const ArchType = Archetype(TestBigRegistry);
+    var arch = ArchType.init(mask, &pool);
+    defer arch.deinit(std.testing.allocator);
+
+    // 10000-byte component: one row + entity must still fit in a 16 KB chunk,
+    // so capacity must be >= 1 and the column must stay inside the chunk.
+    try std.testing.expect(arch.capacity >= 1);
+    try std.testing.expect(arch.column_offsets[0] + @as(u32, arch.capacity) * @sizeOf(TestBig) <= chunk_data_size);
+
+    // Append more entities than fit in one chunk to exercise overflow.
+    const n = @as(u32, arch.capacity) + 3;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const e: EntityID = .{ .index = @intCast(i), .generation = 0 };
+        const r = try arch.appendEntity(e, std.testing.allocator);
+        const chunk = arch.chunks.items[r.chunk_idx];
+        arch.getColumn(chunk, TestBig)[r.row].blob[0] = @intCast(i & 0xff);
+    }
+    try std.testing.expectEqual(n, arch.entity_count);
 }
 
 test "Archetype ZST component" {

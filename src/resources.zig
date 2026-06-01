@@ -2,6 +2,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+/// Standard resource: the current frame's delta time, in seconds.
+pub const DeltaTime = struct { seconds: f32 = 0 };
+
+/// Standard resource: a monotonically increasing frame counter.
+pub const FrameCount = struct { value: u64 = 0 };
+
 /// Type-erased singleton resource storage.
 /// Stores one value per type, accessible by comptime type key.
 pub const Resources = struct {
@@ -132,12 +138,12 @@ test "Resources multiple types" {
     var res = Resources.init(testing.allocator);
     defer res.deinit();
 
-    const DeltaTime = struct { dt: f32 };
-    const FrameCount = struct { count: u64 };
+    const Dt = struct { dt: f32 };
+    const Frames = struct { count: u64 };
 
-    try res.set(DeltaTime, .{ .dt = 0.016 });
-    try res.set(FrameCount, .{ .count = 100 });
+    try res.set(Dt, .{ .dt = 0.016 });
+    try res.set(Frames, .{ .count = 100 });
 
-    try testing.expectApproxEqAbs(0.016, res.get(DeltaTime).dt, 0.0001);
-    try testing.expectEqual(100, res.get(FrameCount).count);
+    try testing.expectApproxEqAbs(0.016, res.get(Dt).dt, 0.0001);
+    try testing.expectEqual(100, res.get(Frames).count);
 }

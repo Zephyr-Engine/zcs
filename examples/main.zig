@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n=== Example 4: Schedule tick ===\n", .{});
 
     for (0..10) |tick| {
-        try Ecs.Schedule.tick(&world, &cmd, .{
+        try Ecs.Schedule.tickDt(&world, &cmd, 0.016, .{
             .pre_update = &.{gravitySystem},
             .update = &.{ movementSystem, damageSystem },
         });
@@ -154,21 +154,18 @@ pub fn main(init: std.process.Init) !void {
     try world.removeComponent(player, Disabled);
     std.debug.print("  Player disabled after remove: {}\n", .{world.hasComponent(player, Disabled)});
 
-    // ── Example 6: Resources ───────────────────────────────────────
+    // ── Example 6: Resources (world-owned) ─────────────────────────
 
     std.debug.print("\n=== Example 6: Resources ===\n", .{});
 
-    const DeltaTime = struct { dt: f32 };
-    const FrameCount = struct { count: u64 };
+    // Standard resources are populated by Schedule.tickDt; systems read them
+    // via world.getResource(...). Custom resources work the same way.
+    const Score = struct { points: u32 };
+    try world.setResource(Score, .{ .points = 1500 });
 
-    var resources = zcs.Resources.init(allocator);
-    defer resources.deinit();
-
-    try resources.set(DeltaTime, .{ .dt = 0.016 });
-    try resources.set(FrameCount, .{ .count = 0 });
-
-    std.debug.print("  DeltaTime: {d:.3}s\n", .{resources.get(DeltaTime).dt});
-    std.debug.print("  FrameCount: {d}\n", .{resources.get(FrameCount).count});
+    std.debug.print("  DeltaTime: {d:.3}s\n", .{world.getResource(zcs.DeltaTime).seconds});
+    std.debug.print("  FrameCount: {d}\n", .{world.getResource(zcs.FrameCount).value});
+    std.debug.print("  Score: {d}\n", .{world.getResource(Score).points});
 
     // ── Example 7: SparseSet ───────────────────────────────────────
 

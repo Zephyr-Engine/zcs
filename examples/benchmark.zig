@@ -114,6 +114,48 @@ fn benchSpawnWithComponents(allocator: std.mem.Allocator, io: Io, cfg: Config) B
     return .{ .name = "spawn + 2 components", .total_ns = total_ns, .iters = cfg.iters, .entity_count = cfg.entity_count };
 }
 
+fn benchSpawnWithBundle(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchResult {
+    var total_ns: i96 = 0;
+
+    for (0..cfg.warmup + cfg.iters) |i| {
+        var world = Ecs.World.init(allocator);
+        defer world.deinit();
+
+        const start = timestamp(io);
+        for (0..cfg.entity_count) |j| {
+            const fx: f32 = @floatFromInt(j);
+            _ = world.spawnWith(.{ Position{ .x = fx, .y = 0 }, Velocity{ .vx = 1, .vy = 0 } }) catch unreachable;
+        }
+        const elapsed = timestamp(io) - start;
+        if (i >= cfg.warmup) total_ns += elapsed;
+    }
+
+    return .{ .name = "spawnWith bundle (2 comp)", .total_ns = total_ns, .iters = cfg.iters, .entity_count = cfg.entity_count };
+}
+
+fn benchCommandBufferBundle(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchResult {
+    var total_ns: i96 = 0;
+
+    for (0..cfg.warmup + cfg.iters) |i| {
+        var world = Ecs.World.init(allocator);
+        defer world.deinit();
+
+        var cmd_buf = Ecs.CommandBuffer.init(&world);
+        defer cmd_buf.deinit();
+
+        const start = timestamp(io);
+        for (0..cfg.entity_count) |j| {
+            const fx: f32 = @floatFromInt(j);
+            _ = cmd_buf.spawnWith(.{ Position{ .x = fx, .y = 0 }, Velocity{ .vx = 1, .vy = 0 } }) catch unreachable;
+        }
+        cmd_buf.flush() catch unreachable;
+        const elapsed = timestamp(io) - start;
+        if (i >= cfg.warmup) total_ns += elapsed;
+    }
+
+    return .{ .name = "cmd spawnWith+flush (2 comp)", .total_ns = total_ns, .iters = cfg.iters, .entity_count = cfg.entity_count };
+}
+
 fn benchDespawn(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchResult {
     var total_ns: i96 = 0;
 
@@ -263,6 +305,70 @@ fn benchCommandBuffer(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchRe
     return .{ .name = "command buffer spawn+flush", .total_ns = total_ns, .iters = cfg.iters, .entity_count = cfg.entity_count };
 }
 
+// A deliberately heavy per-entity workload, so thread-spawn overhead is
+// amortized and the parallel speedup is visible.
+fn heavyWork(positions: []Position, velocities: []const Velocity) void {
+    for (positions, velocities) |*pos, vel| {
+        var x = pos.x;
+        var y = pos.y;
+        var k: usize = 0;
+        while (k < 64) : (k += 1) {
+            x = @sqrt(x * x + vel.vx + 1.0) + 0.0001;
+            y = @sqrt(y * y + vel.vy + 1.0) + 0.0001;
+        }
+        pos.x = x;
+        pos.y = y;
+    }
+}
+
+fn seedHeavyWorld(world: *Ecs.World, n: usize) void {
+    for (0..n) |j| {
+        const fx: f32 = @floatFromInt(j % 100);
+        _ = world.spawnWith(.{ Position{ .x = fx, .y = fx }, Velocity{ .vx = 1, .vy = 1 } }) catch unreachable;
+    }
+}
+
+fn benchHeavySeq(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchResult {
+    var world = Ecs.World.init(allocator);
+    defer world.deinit();
+    seedHeavyWorld(&world, cfg.entity_count);
+
+    var total_ns: i96 = 0;
+    for (0..cfg.warmup + cfg.iters) |i| {
+        const start = timestamp(io);
+        var iter = world.query(.{ .write = &.{Position}, .read = &.{Velocity} });
+        while (iter.next()) |view| {
+            heavyWork(view.write(Position), view.read(Velocity));
+        }
+        const elapsed = timestamp(io) - start;
+        if (i >= cfg.warmup) total_ns += elapsed;
+    }
+    return .{ .name = "heavy iterate (sequential)", .total_ns = total_ns, .iters = cfg.iters, .entity_count = cfg.entity_count };
+}
+
+fn benchHeavyPar(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchResult {
+    var world = Ecs.World.init(allocator);
+    defer world.deinit();
+    seedHeavyWorld(&world, cfg.entity_count);
+
+    var pool: zcs.ThreadPool = undefined;
+    pool.init(allocator, 0) catch unreachable;
+    defer pool.deinit();
+
+    var total_ns: i96 = 0;
+    for (0..cfg.warmup + cfg.iters) |i| {
+        const start = timestamp(io);
+        Ecs.Parallel.forEachChunk(&pool, &world, .{ .write = &.{Position}, .read = &.{Velocity} }, {}, struct {
+            fn body(_: void, view: anytype) void {
+                heavyWork(view.write(Position), view.read(Velocity));
+            }
+        }.body) catch unreachable;
+        const elapsed = timestamp(io) - start;
+        if (i >= cfg.warmup) total_ns += elapsed;
+    }
+    return .{ .name = "heavy iterate (parallel)", .total_ns = total_ns, .iters = cfg.iters, .entity_count = cfg.entity_count };
+}
+
 fn benchGameFrame(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchResult {
     var world = Ecs.World.init(allocator);
     defer world.deinit();
@@ -323,14 +429,18 @@ pub fn main(init: std.process.Init) !void {
     });
     std.debug.print("  ------------------------------------------------------------\n", .{});
 
-    const results: [8]BenchResult = .{
+    const results: [12]BenchResult = .{
         benchSpawn(allocator, io, cfg),
         benchSpawnWithComponents(allocator, io, cfg),
+        benchSpawnWithBundle(allocator, io, cfg),
         benchDespawn(allocator, io, cfg),
         benchIterate2(allocator, io, cfg),
         benchIterate4(allocator, io, cfg),
         benchArchetypeMove(allocator, io, cfg),
         benchCommandBuffer(allocator, io, cfg),
+        benchCommandBufferBundle(allocator, io, cfg),
+        benchHeavySeq(allocator, io, cfg),
+        benchHeavyPar(allocator, io, cfg),
         benchGameFrame(allocator, io, cfg),
     };
 

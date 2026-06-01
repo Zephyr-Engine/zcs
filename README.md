@@ -11,11 +11,19 @@ Designed for the [Zephyr Game Engine](https://github.com/Zephyr-Engine) but full
 - **Zero-sized type (ZST) tags** — tag components like `Player` or `Enemy` affect archetype matching but allocate no storage.
 - **O(1) entity operations** — generational `EntityID` (24-bit index + 8-bit generation) with free-list reuse and stale handle detection.
 - **Edge-cached archetype transitions** — adding or removing a component reuses a cached pointer to the target archetype.
+- **Bundle spawn** — `world.spawnWith(.{ Position{...}, Velocity{...} })` builds an entity in its final archetype with a single insertion (no per-component churn); also available on the CommandBuffer.
+- **Cached queries** — matching archetype lists are cached per query shape and rebuilt only when a new archetype appears.
 - **Swap-remove deletion** — O(1) unordered entity removal with automatic back-fill from the last slot.
-- **CommandBuffer** — deferred structural mutations (spawn, despawn, add/remove component) safe to use during iteration.
-- **Schedule** — phased system execution (pre_update, update, post_update, render) with automatic CommandBuffer flushing.
-- **Resources** — type-erased singleton storage for global game state (delta time, frame count, etc.).
+- **CommandBuffer** — deferred structural mutations (spawn, spawnWith, despawn, add/remove component) safe to use during iteration.
+- **Parallel chunk dispatch** — `Parallel.forEachChunk` spreads a system across a `ThreadPool`, one chunk per task (disjoint memory, data-race free).
+- **Change detection** — per-chunk/per-component write ticks; `view.changedSince(T, tick)` skips unmodified data.
+- **Schedule** — phased system execution (pre_update, update, post_update, render) with automatic CommandBuffer flushing, delta-time, and frame counting (`tickDt`).
+- **Resources** — world-owned, type-erased singleton storage for global game state (delta time, frame count, etc.), readable from any system.
+- **Lifecycle observers** — opt-in `on_spawn`/`on_despawn`/`on_add`/`on_remove` callbacks with near-zero cost when unused.
+- **Serialization** — binary round-trip of full world state (entities, generations, component columns).
+- **Diagnostics** — `world.stats()` reports entity/archetype/chunk counts, occupancy, and memory use.
 - **SparseSet** — generation-aware associative container for per-entity side data (debug names, editor metadata).
+- **Pre-warming & reset** — `world.preWarm(...)` to pre-allocate, `world.clear()` for fast scene reloads.
 - **Zero dependencies** — built entirely on `std`.
 
 ## Requirements
