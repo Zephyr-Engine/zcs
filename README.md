@@ -9,7 +9,7 @@ Designed for the [Zephyr Game Engine](https://github.com/Zephyr-Engine) but full
 - **Archetype SoA layout** — components are stored in Structure-of-Arrays within 16KB cache-aligned chunks for maximum iteration throughput.
 - **Comptime query validation** — read vs write access is enforced at compile time. Accessing a component you didn't declare is a compile error.
 - **Zero-sized type (ZST) tags** — tag components like `Player` or `Enemy` affect archetype matching but allocate no storage.
-- **O(1) entity operations** — generational `EntityID` (24-bit index + 8-bit generation) with free-list reuse and stale handle detection.
+- **O(1) entity operations** — 64-bit generational `EntityID` (32-bit index + 32-bit generation) with free-list reuse and stale handle detection. Generations start at 1, so `nil` is raw zero (zero-initialized memory is a nil handle); a slot that exhausts its generations is retired rather than wrapped, so a stale handle can never alias a new entity.
 - **Edge-cached archetype transitions** — adding or removing a component reuses a cached pointer to the target archetype.
 - **Bundle spawn** — `world.spawnWith(.{ Position{...}, Velocity{...} })` builds an entity in its final archetype with a single insertion (no per-component churn); also available on the CommandBuffer.
 - **Cached queries** — matching archetype lists are cached per query shape and rebuilt only when a new archetype appears.
@@ -20,7 +20,7 @@ Designed for the [Zephyr Game Engine](https://github.com/Zephyr-Engine) but full
 - **Schedule** — phased system execution (pre_update, update, post_update, render) with automatic CommandBuffer flushing, delta-time, and frame counting (`tickDt`).
 - **Resources** — world-owned, type-erased singleton storage for global game state (delta time, frame count, etc.), readable from any system.
 - **Lifecycle observers** — opt-in `on_spawn`/`on_despawn`/`on_add`/`on_remove` callbacks with near-zero cost when unused.
-- **Serialization** — binary round-trip of full world state (entities, generations, component columns).
+- **Serialization** — binary round-trip of full world state (entities, generations, component columns). Same-build snapshot format (`ZCS2`), not a portable scene format.
 - **Diagnostics** — `world.stats()` reports entity/archetype/chunk counts, occupancy, and memory use.
 - **SparseSet** — generation-aware associative container for per-entity side data (debug names, editor metadata).
 - **Pre-warming & reset** — `world.preWarm(...)` to pre-allocate, `world.clear()` for fast scene reloads.

@@ -321,7 +321,7 @@ test "Archetype append and column access" {
     var arch = ArchType.init(mask, &pool);
     defer arch.deinit(std.testing.allocator);
 
-    const e0: EntityID = .{ .index = 0, .generation = 0 };
+    const e0: EntityID = .{ .index = 0, .generation = 1 };
     const result = try arch.appendEntity(e0, std.testing.allocator);
     try std.testing.expectEqual(0, result.chunk_idx);
     try std.testing.expectEqual(0, result.row);
@@ -348,9 +348,9 @@ test "Archetype swap-remove" {
     var arch = ArchType.init(mask, &pool);
     defer arch.deinit(std.testing.allocator);
 
-    const e0: EntityID = .{ .index = 0, .generation = 0 };
-    const e1: EntityID = .{ .index = 1, .generation = 0 };
-    const e2: EntityID = .{ .index = 2, .generation = 0 };
+    const e0: EntityID = .{ .index = 0, .generation = 1 };
+    const e1: EntityID = .{ .index = 1, .generation = 1 };
+    const e2: EntityID = .{ .index = 2, .generation = 1 };
 
     _ = try arch.appendEntity(e0, std.testing.allocator);
     _ = try arch.appendEntity(e1, std.testing.allocator);
@@ -405,7 +405,7 @@ test "Archetype large component clamps capacity and stays in bounds" {
     const n = @as(u32, arch.capacity) + 3;
     var i: u32 = 0;
     while (i < n) : (i += 1) {
-        const e: EntityID = .{ .index = @intCast(i), .generation = 0 };
+        const e: EntityID = .{ .index = @intCast(i), .generation = 1 };
         const r = try arch.appendEntity(e, std.testing.allocator);
         const chunk = arch.chunks.items[r.chunk_idx];
         arch.getColumn(chunk, TestBig)[r.row].blob[0] = @intCast(i & 0xff);
@@ -424,7 +424,7 @@ test "Archetype ZST component" {
     var arch = ArchType.init(mask, &pool);
     defer arch.deinit(std.testing.allocator);
 
-    const e: EntityID = .{ .index = 0, .generation = 0 };
+    const e: EntityID = .{ .index = 0, .generation = 1 };
     const result = try arch.appendEntity(e, std.testing.allocator);
     try std.testing.expectEqual(0, result.row);
     try std.testing.expectEqual(1, arch.entity_count);

@@ -70,13 +70,13 @@ test "EventQueue push and drain" {
     var q = Evt.EventQueue(Evt.OnSpawn).init(testing.allocator);
     defer q.deinit();
 
-    try q.push(.{ .entity = .{ .index = 0, .generation = 0 } });
-    try q.push(.{ .entity = .{ .index = 1, .generation = 0 } });
+    try q.push(.{ .entity = .{ .index = 0, .generation = 1 } });
+    try q.push(.{ .entity = .{ .index = 1, .generation = 1 } });
 
     const events = q.drain();
     try testing.expectEqual(2, events.len);
-    try testing.expectEqual(@as(u24, 0), events[0].entity.index);
-    try testing.expectEqual(@as(u24, 1), events[1].entity.index);
+    try testing.expectEqual(@as(u32, 0), events[0].entity.index);
+    try testing.expectEqual(@as(u32, 1), events[1].entity.index);
 
     q.clear();
     try testing.expectEqual(0, q.count());

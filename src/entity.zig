@@ -2,33 +2,53 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
-/// A unique identifier for an entity, packed into 32 bits.
-/// Contains a 24-bit index and an 8-bit generation counter.
-pub const EntityID = packed struct {
-    index: u24,
-    generation: u8,
+/// A unique identifier for an entity, packed into 64 bits.
+/// Contains a 32-bit slot index and a 32-bit generation counter.
+///
+/// Invariants:
+/// - Every issued handle has `generation >= 1`; generation 0 is reserved for
+///   `nil`, so `nil.toRaw() == 0` and zero-initialized memory is a nil handle.
+///   This matches the plugin-ABI shape `EntityHandle = enum(u64) { none = 0 }`
+///   (see docs/dynamic-game-architecture.md): an EntityID bitcasts 1:1 into an
+///   ABI handle.
+/// - `generation == max_generation` is never issued; it marks a retired slot
+///   inside `EntityPool`.
+/// - All handles must come from an `EntityPool`; hand-constructed handles in
+///   tests must use `generation >= 1`.
+pub const EntityID = packed struct(u64) {
+    index: u32,
+    generation: u32,
 
-    pub const nil: EntityID = .{ .index = std.math.maxInt(u24), .generation = 0 };
+    pub const nil: EntityID = .{ .index = 0, .generation = 0 };
+
+    /// Reserved generation marking a slot that exhausted its generations and
+    /// is permanently retired. Never present in an issued handle.
+    pub const max_generation: u32 = std.math.maxInt(u32);
 
     pub fn eql(self: EntityID, other: EntityID) bool {
-        return self.index == other.index and self.generation == other.generation;
+        return self.toRaw() == other.toRaw();
     }
 
-    pub fn toRaw(self: EntityID) u32 {
+    pub fn toRaw(self: EntityID) u64 {
         return @bitCast(self);
     }
 
-    pub fn fromRaw(raw: u32) EntityID {
+    pub fn fromRaw(raw: u64) EntityID {
         return @bitCast(raw);
     }
 };
 
+/// Generation value stamped on never-used slots; the first handle for any
+/// slot is issued with this generation, keeping generation 0 exclusive to
+/// `EntityID.nil`.
+const first_generation: u32 = 1;
+
 /// Manages entity allocation, generation tracking, and index reuse.
 pub const EntityPool = struct {
-    generations: []u8,
-    free_list: std.ArrayListUnmanaged(u24),
+    generations: []u32,
+    free_list: std.ArrayListUnmanaged(u32),
     alive_count: u32,
-    len: u24,
+    len: u32,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) EntityPool {
@@ -41,11 +61,11 @@ pub const EntityPool = struct {
         };
     }
 
-    pub fn initCapacity(allocator: Allocator, capacity: u24) !EntityPool {
-        const gens = try allocator.alloc(u8, capacity);
+    pub fn initCapacity(allocator: Allocator, capacity: u32) !EntityPool {
+        const gens = try allocator.alloc(u32, capacity);
         errdefer allocator.free(gens);
-        @memset(gens, 0);
-        var free_list: std.ArrayListUnmanaged(u24) = .empty;
+        @memset(gens, first_generation);
+        var free_list: std.ArrayListUnmanaged(u32) = .empty;
         // Reserve so `destroy` never needs to allocate (and can't silently drop
         // a recycled index): the free list never exceeds `generations.len`.
         errdefer free_list.deinit(allocator);
@@ -72,63 +92,90 @@ pub const EntityPool = struct {
             return .{ .index = index, .generation = self.generations[index] };
         }
 
-        const index = self.len;
-        if (index == std.math.maxInt(u24)) return error.EntityLimitReached;
-
-        if (index >= self.generations.len) {
-            const old_len = self.generations.len;
-            const new_cap = @max(old_len * 2, 64);
-            const new_cap_clamped: usize = @min(new_cap, std.math.maxInt(u24) + 1);
-            const new_gens = try self.allocator.alloc(u8, new_cap_clamped);
-            @memset(new_gens[old_len..], 0);
-            if (old_len > 0) {
-                @memcpy(new_gens[0..old_len], self.generations);
-                self.allocator.free(self.generations);
+        var index = self.len;
+        while (true) {
+            if (index == std.math.maxInt(u32)) {
+                return error.EntityLimitReached;
             }
-            self.generations = new_gens;
-            // Keep the free list able to hold every index, so `destroy` is
-            // allocation-free and can never drop a recycled index.
-            try self.free_list.ensureTotalCapacity(self.allocator, new_cap_clamped);
+
+            if (index >= self.generations.len) {
+                const old_len = self.generations.len;
+                const new_cap = @max(old_len * 2, 64);
+                const new_cap_clamped: usize = @min(new_cap, @as(usize, std.math.maxInt(u32)) + 1);
+                const new_gens = try self.allocator.alloc(u32, new_cap_clamped);
+                @memset(new_gens[old_len..], first_generation);
+                if (old_len > 0) {
+                    @memcpy(new_gens[0..old_len], self.generations);
+                    self.allocator.free(self.generations);
+                }
+                self.generations = new_gens;
+                // Keep the free list able to hold every index, so `destroy` is
+                // allocation-free and can never drop a recycled index.
+                try self.free_list.ensureTotalCapacity(self.allocator, new_cap_clamped);
+            }
+
+            // A retired slot exhausted its generations; skip it forever.
+            if (self.generations[index] != EntityID.max_generation) {
+                break;
+            }
+            index += 1;
         }
 
         self.len = index + 1;
         self.alive_count += 1;
-        // Read the slot's generation rather than assuming 0: a never-used slot
-        // is 0 (memset), but after `clear()` reused slots carry a bumped
-        // generation so stale handles stay invalid.
+        // Read the slot's generation rather than assuming first_generation: a
+        // never-used slot is first_generation (memset), but after `clear()`
+        // reused slots carry a bumped generation so stale handles stay invalid.
         return .{ .index = index, .generation = self.generations[index] };
     }
 
     pub fn destroy(self: *EntityPool, id: EntityID) void {
         if (!self.isAlive(id)) return;
-        self.generations[id.index] +%= 1;
+        self.alive_count -= 1;
+        const next = self.generations[id.index] + 1;
+        self.generations[id.index] = next;
+        // A slot that reached max_generation is retired: it is never recycled,
+        // so no stale handle can ever alias a new one (no ABA wraparound).
+        if (next == EntityID.max_generation) {
+            return;
+        }
         // Capacity was reserved when the index was created, so this never
         // allocates and never drops the index.
         self.free_list.appendAssumeCapacity(id.index);
-        self.alive_count -= 1;
     }
 
     /// Reset the pool to empty, retaining the generations allocation. Every
     /// live index's generation is bumped so previously-issued handles remain
     /// invalid and cannot collide with reused indices.
     pub fn clear(self: *EntityPool) void {
-        for (self.generations[0..self.len]) |*g| g.* +%= 1;
+        for (self.generations[0..self.len]) |*g| {
+            if (g.* != EntityID.max_generation) g.* += 1;
+        }
         self.len = 0;
         self.alive_count = 0;
         self.free_list.clearRetainingCapacity();
     }
 
     pub fn isAlive(self: *const EntityPool, id: EntityID) bool {
-        if (id.eql(EntityID.nil)) return false;
-        if (id.index >= self.len) return false;
+        // Generation 0 is reserved for nil and never issued or stored.
+        if (id.generation == 0) {
+            return false;
+        }
+        if (id.index >= self.len) {
+            return false;
+        }
         return self.generations[id.index] == id.generation;
     }
 };
 
-test "EntityID nil sentinel" {
+test "EntityID nil sentinel is raw zero" {
     const nil = EntityID.nil;
     try testing.expect(nil.eql(EntityID.nil));
-    try testing.expect(!nil.eql(.{ .index = 0, .generation = 0 }));
+    try testing.expectEqual(@as(u64, 0), nil.toRaw());
+    try testing.expect(EntityID.fromRaw(0).eql(nil));
+    // A live handle at index 0 is distinct from nil because generations
+    // start at 1.
+    try testing.expect(!nil.eql(.{ .index = 0, .generation = 1 }));
 }
 
 test "EntityID raw round-trip" {
@@ -136,6 +183,15 @@ test "EntityID raw round-trip" {
     const raw = id.toRaw();
     const back = EntityID.fromRaw(raw);
     try testing.expect(id.eql(back));
+}
+
+test "EntityPool issues generations starting at 1" {
+    var pool = EntityPool.init(testing.allocator);
+    defer pool.deinit();
+
+    const e = try pool.create();
+    try testing.expectEqual(@as(u32, 1), e.generation);
+    try testing.expect(!e.eql(EntityID.nil));
 }
 
 test "EntityPool create and destroy" {
@@ -225,19 +281,39 @@ test "EntityPool destroy is allocation-free under many recycles" {
     try testing.expectEqual(0, e.index);
 }
 
-test "EntityPool generation wraparound" {
+test "EntityPool retires a slot at generation exhaustion instead of wrapping" {
     var pool = EntityPool.init(testing.allocator);
     defer pool.deinit();
 
-    var id = try pool.create();
-    const idx = id.index;
+    const e0 = try pool.create();
+    // Simulate an ancient slot one destroy away from exhaustion.
+    pool.generations[e0.index] = EntityID.max_generation - 1;
+    const old: EntityID = .{ .index = e0.index, .generation = EntityID.max_generation - 1 };
+    try testing.expect(pool.isAlive(old));
 
-    // Cycle through all 256 generations
-    for (0..256) |_| {
-        pool.destroy(id);
-        id = try pool.create();
-        try testing.expectEqual(idx, id.index);
-    }
-    // After 256 destroys, generation wraps to 0
-    try testing.expectEqual(@as(u8, 0), id.generation);
+    pool.destroy(old);
+    try testing.expect(!pool.isAlive(old));
+    try testing.expectEqual(0, pool.alive_count);
+    // The slot was retired, not recycled: no free-list entry, and the next
+    // create must use a fresh index.
+    try testing.expectEqual(@as(usize, 0), pool.free_list.items.len);
+    const e1 = try pool.create();
+    try testing.expect(e1.index != e0.index);
+    try testing.expect(pool.isAlive(e1));
+}
+
+test "EntityPool create skips retired slots after clear" {
+    var pool = EntityPool.init(testing.allocator);
+    defer pool.deinit();
+
+    const e0 = try pool.create();
+    pool.generations[e0.index] = EntityID.max_generation - 1;
+    pool.destroy(.{ .index = e0.index, .generation = EntityID.max_generation - 1 });
+
+    pool.clear();
+    // len reset to 0, but slot 0 stays retired; the sequential path must
+    // skip it.
+    const e1 = try pool.create();
+    try testing.expect(e1.index != e0.index);
+    try testing.expect(pool.isAlive(e1));
 }
