@@ -14,7 +14,7 @@ pub fn SparseSet(comptime V: type) type {
 
         dense_entities: std.ArrayListUnmanaged(EntityID),
         dense_values: std.ArrayListUnmanaged(V),
-        sparse: std.AutoHashMapUnmanaged(u24, u32),
+        sparse: std.AutoHashMapUnmanaged(u32, u32),
         allocator: Allocator,
 
         pub fn init(allocator: Allocator) Self {
@@ -112,7 +112,7 @@ test "SparseSet set and get" {
     var ss = SparseSet(f32).init(testing.allocator);
     defer ss.deinit();
 
-    const e: EntityID = .{ .index = 5, .generation = 0 };
+    const e: EntityID = .{ .index = 5, .generation = 1 };
     try ss.set(e, 3.14);
 
     const val = ss.get(e).?;
@@ -123,9 +123,9 @@ test "SparseSet remove with swap" {
     var ss = SparseSet(i32).init(testing.allocator);
     defer ss.deinit();
 
-    const e0: EntityID = .{ .index = 0, .generation = 0 };
-    const e1: EntityID = .{ .index = 1, .generation = 0 };
-    const e2: EntityID = .{ .index = 2, .generation = 0 };
+    const e0: EntityID = .{ .index = 0, .generation = 1 };
+    const e1: EntityID = .{ .index = 1, .generation = 1 };
+    const e2: EntityID = .{ .index = 2, .generation = 1 };
 
     try ss.set(e0, 10);
     try ss.set(e1, 20);
@@ -145,8 +145,8 @@ test "SparseSet stale generation" {
     var ss = SparseSet(i32).init(testing.allocator);
     defer ss.deinit();
 
-    const e_old: EntityID = .{ .index = 5, .generation = 0 };
-    const e_new: EntityID = .{ .index = 5, .generation = 1 };
+    const e_old: EntityID = .{ .index = 5, .generation = 1 };
+    const e_new: EntityID = .{ .index = 5, .generation = 2 };
 
     try ss.set(e_old, 42);
     try testing.expect(ss.contains(e_old));
@@ -158,7 +158,7 @@ test "SparseSet overwrite existing" {
     var ss = SparseSet(i32).init(testing.allocator);
     defer ss.deinit();
 
-    const e: EntityID = .{ .index = 0, .generation = 0 };
+    const e: EntityID = .{ .index = 0, .generation = 1 };
     try ss.set(e, 1);
     try ss.set(e, 2);
     try testing.expectEqual(2, ss.get(e).?.*);
@@ -169,8 +169,8 @@ test "SparseSet iteration" {
     var ss = SparseSet(i32).init(testing.allocator);
     defer ss.deinit();
 
-    const e0: EntityID = .{ .index = 0, .generation = 0 };
-    const e1: EntityID = .{ .index = 1, .generation = 0 };
+    const e0: EntityID = .{ .index = 0, .generation = 1 };
+    const e1: EntityID = .{ .index = 1, .generation = 1 };
 
     try ss.set(e0, 100);
     try ss.set(e1, 200);

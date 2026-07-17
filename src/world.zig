@@ -89,9 +89,13 @@ pub fn World(comptime Reg: type) type {
 
         /// Pre-allocate `chunk_count` chunks and reserve location storage for
         /// `entity_hint` entities, to avoid hot-path allocations during play.
-        pub fn preWarm(self: *Self, entity_hint: u24, chunk_count: usize) !void {
-            if (chunk_count > 0) try self.chunk_pool.preWarm(chunk_count);
-            if (entity_hint > 0) try self.ensureLocationCapacity(entity_hint - 1);
+        pub fn preWarm(self: *Self, entity_hint: u32, chunk_count: usize) !void {
+            if (chunk_count > 0) {
+                try self.chunk_pool.preWarm(chunk_count);
+            }
+            if (entity_hint > 0) {
+                try self.ensureLocationCapacity(entity_hint - 1);
+            }
         }
 
         /// Reset the world to empty for reuse (e.g. scene reload), retaining
@@ -516,7 +520,7 @@ pub fn World(comptime Reg: type) type {
             return cached.list.items;
         }
 
-        pub fn ensureLocationCapacity(self: *Self, index: u24) !void {
+        pub fn ensureLocationCapacity(self: *Self, index: u32) !void {
             const needed = @as(usize, index) + 1;
             if (needed > self.locations.items.len) {
                 try self.locations.appendNTimes(self.allocator, .{}, needed - self.locations.items.len);

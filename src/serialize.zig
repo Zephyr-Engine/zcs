@@ -6,7 +6,7 @@ const world_mod = @import("world.zig");
 const testing = std.testing;
 
 /// Magic + version tag at the head of a serialized blob.
-const magic: [4]u8 = .{ 'Z', 'C', 'S', '1' };
+const magic: [4]u8 = .{ 'Z', 'C', 'S', '2' };
 
 pub const Error = error{
     BadMagic,
@@ -64,7 +64,9 @@ pub fn Serializer(comptime Reg: type) type {
             const len: u32 = pool.len;
             try putInt(out, allocator, u32, len);
             try putInt(out, allocator, u32, pool.alive_count);
-            try out.appendSlice(allocator, pool.generations[0..len]);
+            for (pool.generations[0..len]) |g| {
+                try putInt(out, allocator, u32, g);
+            }
             try putInt(out, allocator, u32, @intCast(pool.free_list.items.len));
             for (pool.free_list.items) |idx| {
                 try putInt(out, allocator, u32, idx);
@@ -88,7 +90,7 @@ pub fn Serializer(comptime Reg: type) type {
                     const ids = arch.getEntityColumn(chunk);
                     var row: u16 = 0;
                     while (row < chunk.count) : (row += 1) {
-                        try putInt(out, allocator, u32, ids[row].toRaw());
+                        try putInt(out, allocator, u64, ids[row].toRaw());
                         inline for (0..component_count) |comp_id| {
                             const size = Reg.component_sizes[comp_id];
                             if (size > 0 and arch.mask.isSet(comp_id)) {
@@ -116,12 +118,12 @@ pub fn Serializer(comptime Reg: type) type {
             // ── Entity pool ───────────────────────────────────────────
             const len = try cur.int(u32);
             const alive_count = try cur.int(u32);
-            const gen_bytes = try cur.take(len);
 
             const pool = &world.entity_pool;
             if (len > 0) {
-                const gens = try allocator.alloc(u8, len);
-                @memcpy(gens, gen_bytes);
+                const gens = try allocator.alloc(u32, len);
+                errdefer allocator.free(gens);
+                for (gens) |*g| g.* = try cur.int(u32);
                 pool.generations = gens;
             }
             pool.len = @intCast(len);
@@ -147,7 +149,7 @@ pub fn Serializer(comptime Reg: type) type {
 
                 var e: u32 = 0;
                 while (e < ecount) : (e += 1) {
-                    const id = EntityID.fromRaw(try cur.int(u32));
+                    const id = EntityID.fromRaw(try cur.int(u64));
                     var comps: [component_count]RawComponent = undefined;
                     var nc: usize = 0;
                     inline for (0..component_count) |comp_id| {
