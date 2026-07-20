@@ -184,6 +184,17 @@ pub fn Archetype(comptime Reg: type) type {
                     const src = last_chunk.data[offset + @as(usize, last_row) * size ..][0..size];
                     @memcpy(dst, src);
                 }
+
+                // The moved row may be more recently written than anything in
+                // its new chunk; merge ticks so change detection stays
+                // conservative (false positives, never false negatives).
+                if (chunk_idx != last_chunk_idx) {
+                    const dst_ticks = &self.change_ticks.items[chunk_idx];
+                    const src_ticks = &self.change_ticks.items[last_chunk_idx];
+                    for (dst_ticks, src_ticks) |*d, s| {
+                        if (s > d.*) d.* = s;
+                    }
+                }
             }
 
             last_chunk.count -= 1;

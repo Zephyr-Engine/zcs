@@ -4,8 +4,12 @@ const testing = std.testing;
 
 pub const chunk_data_size: usize = 16 * 1024;
 
+/// Alignment of a chunk's data block; the maximum component alignment the
+/// SoA layout can honor (checked at comptime by `Registry`).
+pub const chunk_align: usize = 64;
+
 pub const Chunk = struct {
-    data: [chunk_data_size]u8 align(64) = undefined,
+    data: [chunk_data_size]u8 align(chunk_align) = undefined,
     count: u16 = 0,
 };
 

@@ -129,6 +129,23 @@ pub const EntityPool = struct {
         return .{ .index = index, .generation = self.generations[index] };
     }
 
+    /// Grow the backing storage so that up to `capacity` entity indices can
+    /// be created and destroyed without allocating.
+    pub fn reserve(self: *EntityPool, capacity: u32) !void {
+        if (capacity > self.generations.len) {
+            const old_len = self.generations.len;
+            const new_gens = try self.allocator.alloc(u32, capacity);
+            @memset(new_gens[old_len..], first_generation);
+            if (old_len > 0) {
+                @memcpy(new_gens[0..old_len], self.generations);
+                self.allocator.free(self.generations);
+            }
+            self.generations = new_gens;
+        }
+        // Keep the free list able to hold every index (see `destroy`).
+        try self.free_list.ensureTotalCapacity(self.allocator, self.generations.len);
+    }
+
     pub fn destroy(self: *EntityPool, id: EntityID) void {
         if (!self.isAlive(id)) return;
         self.alive_count -= 1;
@@ -279,6 +296,23 @@ test "EntityPool destroy is allocation-free under many recycles" {
     // Exactly one index was used and recycled each time.
     const e = try pool.create();
     try testing.expectEqual(0, e.index);
+}
+
+test "EntityPool reserve pre-sizes generations and free list" {
+    var pool = EntityPool.init(testing.allocator);
+    defer pool.deinit();
+
+    try pool.reserve(100);
+    try testing.expect(pool.generations.len >= 100);
+    try testing.expect(pool.free_list.capacity >= pool.generations.len);
+
+    // Reserved indices are created and recycled without growing storage.
+    const before = pool.generations.len;
+    var ids: [100]EntityID = undefined;
+    for (&ids) |*id| id.* = try pool.create();
+    for (ids) |id| pool.destroy(id);
+    try testing.expectEqual(before, pool.generations.len);
+    try testing.expectEqual(0, pool.alive_count);
 }
 
 test "EntityPool retires a slot at generation exhaustion instead of wrapping" {

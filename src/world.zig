@@ -87,13 +87,13 @@ pub fn World(comptime Reg: type) type {
             };
         }
 
-        /// Pre-allocate `chunk_count` chunks and reserve location storage for
-        /// `entity_hint` entities, to avoid hot-path allocations during play.
+        /// Pre-allocate `chunk_count` chunks and reserve entity-pool and
+        /// location storage for `entity_hint` entities, to avoid hot-path
+        /// allocations during play.
         pub fn preWarm(self: *Self, entity_hint: u32, chunk_count: usize) !void {
-            if (chunk_count > 0) {
-                try self.chunk_pool.preWarm(chunk_count);
-            }
+            if (chunk_count > 0) try self.chunk_pool.preWarm(chunk_count);
             if (entity_hint > 0) {
+                try self.entity_pool.reserve(entity_hint);
                 try self.ensureLocationCapacity(entity_hint - 1);
             }
         }
@@ -236,6 +236,7 @@ pub fn World(comptime Reg: type) type {
                     arch.getColumn(chunk, f.type)[result.row] = @field(components, f.name);
                 }
             }
+            self.stampChunk(arch, result.chunk_idx);
 
             self.locations.items[id.index] = .{
                 .archetype = arch,
@@ -283,18 +284,19 @@ pub fn World(comptime Reg: type) type {
                     if (@sizeOf(T) > 0) {
                         src_arch.getColumn(src_arch.chunks.items[loc.chunk_idx], T)[loc.row] = value;
                     }
+                    src_arch.chunkChangeTicks(loc.chunk_idx)[comp_id] = self.tick;
                     return;
                 }
 
-                // Archetype move: add component
-                var new_mask = src_arch.mask;
-                new_mask.set(comp_id);
-                const dst_arch = try self.getOrCreateArchetype(new_mask);
-
-                // Check edge cache
-                if (src_arch.add_edges[comp_id] == null) {
-                    src_arch.add_edges[comp_id] = dst_arch;
-                }
+                // Archetype move: add component, reusing the cached edge when
+                // one exists so the common case skips the archetype-map lookup.
+                const dst_arch = src_arch.add_edges[comp_id] orelse blk: {
+                    var new_mask = src_arch.mask;
+                    new_mask.set(comp_id);
+                    const dst = try self.getOrCreateArchetype(new_mask);
+                    src_arch.add_edges[comp_id] = dst;
+                    break :blk dst;
+                };
 
                 try self.moveEntity(id, loc, src_arch, dst_arch);
 
@@ -316,6 +318,7 @@ pub fn World(comptime Reg: type) type {
                 if (@sizeOf(T) > 0) {
                     arch.getColumn(arch.chunks.items[result.chunk_idx], T)[result.row] = value;
                 }
+                arch.chunkChangeTicks(result.chunk_idx)[comp_id] = self.tick;
 
                 loc.* = .{
                     .archetype = arch,
@@ -340,13 +343,6 @@ pub fn World(comptime Reg: type) type {
             var new_mask = src_arch.mask;
             new_mask.unset(comp_id);
 
-            // Check edge cache
-            if (src_arch.remove_edges[comp_id] == null) {
-                if (new_mask.mask != 0) {
-                    src_arch.remove_edges[comp_id] = try self.getOrCreateArchetype(new_mask);
-                }
-            }
-
             if (new_mask.mask == 0) {
                 // No components left — remove from archetype
                 const moved = src_arch.removeEntity(loc.chunk_idx, loc.row);
@@ -359,12 +355,21 @@ pub fn World(comptime Reg: type) type {
                 }
                 loc.* = .{};
             } else {
-                const dst_arch = src_arch.remove_edges[comp_id].?;
+                const dst_arch = src_arch.remove_edges[comp_id] orelse blk: {
+                    const dst = try self.getOrCreateArchetype(new_mask);
+                    src_arch.remove_edges[comp_id] = dst;
+                    break :blk dst;
+                };
                 try self.moveEntity(id, loc, src_arch, dst_arch);
             }
         }
 
         /// Get a mutable pointer to an entity's component. Returns null if not present.
+        ///
+        /// Writes through this pointer bypass change detection (use a query's
+        /// `View.write`/`Row.write`, or `addComponent`, to stamp change ticks).
+        /// The pointer is invalidated by any structural change (spawn,
+        /// despawn, add/remove component) — do not hold it across one.
         pub fn getComponent(self: *Self, id: EntityID, comptime T: type) ?*T {
             comptime if (@sizeOf(T) == 0) @compileError("Use hasComponent for zero-sized types");
 
@@ -387,12 +392,28 @@ pub fn World(comptime Reg: type) type {
         /// Place a freshly-spawned (archetype-less) entity directly into the
         /// archetype for `mask`, setting raw component bytes — one append, no
         /// archetype moves. Used by deferred `CommandBuffer.spawnWith`.
+        ///
+        /// If the entity acquired an archetype since the bundle was queued
+        /// (e.g. a direct `addComponent` before the flush), the bundle is
+        /// applied as individual component adds instead.
         pub fn insertBundleRaw(self: *Self, id: EntityID, mask: ComponentMask, comps: []const RawComponent) !void {
             if (!self.entity_pool.isAlive(id)) return;
             if (mask.mask == 0) return;
             const loc = &self.locations.items[id.index];
-            // Only valid for an entity that is not yet in any archetype.
-            if (loc.archetype != null) return;
+            if (loc.archetype != null) {
+                var it = mask.iterator(.{});
+                outer: while (it.next()) |comp_id| {
+                    for (comps) |c| {
+                        if (c.comp_id == comp_id) {
+                            try self.addComponentRaw(id, comp_id, c.data);
+                            continue :outer;
+                        }
+                    }
+                    // ZST components carry no payload in `comps`.
+                    try self.addComponentRaw(id, comp_id, &.{});
+                }
+                return;
+            }
 
             const arch = try self.getOrCreateArchetype(mask);
             const result = try arch.appendEntity(id, self.allocator);
@@ -400,6 +421,7 @@ pub fn World(comptime Reg: type) type {
             for (comps) |c| {
                 arch.setComponentRaw(chunk, result.row, c.comp_id, c.data);
             }
+            self.stampChunk(arch, result.chunk_idx);
             loc.* = .{
                 .archetype = arch,
                 .chunk_idx = result.chunk_idx,
@@ -420,17 +442,18 @@ pub fn World(comptime Reg: type) type {
                         comp_id,
                         data,
                     );
+                    src_arch.chunkChangeTicks(loc.chunk_idx)[comp_id] = self.tick;
                     return;
                 }
 
-                // Archetype move
-                var new_mask = src_arch.mask;
-                new_mask.set(comp_id);
-                const dst_arch = try self.getOrCreateArchetype(new_mask);
-
-                if (src_arch.add_edges[comp_id] == null) {
-                    src_arch.add_edges[comp_id] = dst_arch;
-                }
+                // Archetype move, via the cached edge when one exists.
+                const dst_arch = src_arch.add_edges[comp_id] orelse blk: {
+                    var new_mask = src_arch.mask;
+                    new_mask.set(comp_id);
+                    const dst = try self.getOrCreateArchetype(new_mask);
+                    src_arch.add_edges[comp_id] = dst;
+                    break :blk dst;
+                };
 
                 try self.moveEntity(id, loc, src_arch, dst_arch);
 
@@ -447,6 +470,7 @@ pub fn World(comptime Reg: type) type {
                 const arch = try self.getOrCreateArchetype(mask);
                 const result = try arch.appendEntity(id, self.allocator);
                 arch.setComponentRaw(arch.chunks.items[result.chunk_idx], result.row, comp_id, data);
+                arch.chunkChangeTicks(result.chunk_idx)[comp_id] = self.tick;
                 loc.* = .{
                     .archetype = arch,
                     .chunk_idx = result.chunk_idx,
@@ -478,11 +502,20 @@ pub fn World(comptime Reg: type) type {
                 }
                 loc.* = .{};
             } else {
-                const dst_arch = try self.getOrCreateArchetype(new_mask);
+                const dst_arch = src_arch.remove_edges[comp_id] orelse blk: {
+                    const dst = try self.getOrCreateArchetype(new_mask);
+                    src_arch.remove_edges[comp_id] = dst;
+                    break :blk dst;
+                };
                 try self.moveEntity(id, loc, src_arch, dst_arch);
             }
         }
 
+        /// Build an iterator over all entities matching `spec`.
+        ///
+        /// Structural changes (spawn, despawn, add/remove component) while an
+        /// iterator is live invalidate it — queue them on a CommandBuffer and
+        /// flush after iteration instead.
         pub fn query(self: *Self, comptime spec: query_mod.QuerySpec) query_mod.QueryIterator(Reg, spec) {
             const Iter = query_mod.QueryIterator(Reg, spec);
             const list = self.matchedArchetypes(Iter) catch {
@@ -501,10 +534,12 @@ pub fn World(comptime Reg: type) type {
             const key = QueryKey{ .required = Iter.req_mask_int, .exclude = Iter.exc_mask_int };
             const gop = try self.query_cache.getOrPut(self.allocator, key);
             if (!gop.found_existing) {
-                gop.value_ptr.* = .{ .generation = undefined, .list = .empty };
+                // Seed with a defined-but-stale generation so a failed rebuild
+                // below leaves the entry safely invalid, never undefined.
+                gop.value_ptr.* = .{ .generation = self.archetype_generation -% 1, .list = .empty };
             }
             const cached = gop.value_ptr;
-            if (gop.found_existing and cached.generation == self.archetype_generation) {
+            if (cached.generation == self.archetype_generation) {
                 return cached.list.items;
             }
 
@@ -532,12 +567,26 @@ pub fn World(comptime Reg: type) type {
                 return arch;
             }
 
+            // On failure, fully unwind: a half-registered archetype (in the
+            // list but not the map) would let a later call create a duplicate
+            // for the same mask and silently split its entities.
             const arch = try self.allocator.create(ArchetypeType);
+            errdefer self.allocator.destroy(arch);
             arch.* = ArchetypeType.init(mask, &self.chunk_pool);
             try self.archetypes.append(self.allocator, arch);
+            errdefer _ = self.archetypes.pop();
             try self.archetype_map.put(self.allocator, mask.mask, arch);
             self.archetype_generation += 1;
             return arch;
+        }
+
+        /// Mark every component column of one chunk as written at the current
+        /// tick. Called when rows are inserted into or moved between chunks,
+        /// so chunk-granular change detection cannot miss the new data.
+        fn stampChunk(self: *Self, arch: *ArchetypeType, chunk_idx: u32) void {
+            const ticks = arch.chunkChangeTicks(chunk_idx);
+            var it = arch.mask.iterator(.{});
+            while (it.next()) |comp_id| ticks[comp_id] = self.tick;
         }
 
         /// Move an entity from src_arch to dst_arch, copying shared component data.
@@ -563,6 +612,9 @@ pub fn World(comptime Reg: type) type {
                 dst_chunk,
                 dst_result.row,
             );
+            // The destination chunk now holds data it did not have before;
+            // stamp it so change detection sees the move.
+            self.stampChunk(dst_arch, dst_result.chunk_idx);
 
             // Remove from source (swap-remove)
             const moved = src_arch.removeEntity(loc.chunk_idx, loc.row);
@@ -863,6 +915,8 @@ test "World preWarm" {
 
     try world.preWarm(1000, 8);
     try std.testing.expect(world.locations.items.len >= 1000);
+    try std.testing.expect(world.entity_pool.generations.len >= 1000);
+    try std.testing.expect(world.entity_pool.free_list.capacity >= 1000);
     try std.testing.expectEqual(8, world.chunk_pool.free_list.items.len);
 
     // Spawning reuses pre-warmed chunks (no new allocation needed).
@@ -909,6 +963,136 @@ test "World spawnWith empty bundle behaves like spawn" {
     const e = try world.spawnWith(.{});
     try std.testing.expect(world.isAlive(e));
     try std.testing.expectEqual(0, world.archetypes.items.len);
+}
+
+test "World archetype transition edges are cached and reused" {
+    var world = World(TestReg).init(std.testing.allocator);
+    defer world.deinit();
+
+    const vel_id = comptime TestReg.id(TestVel);
+
+    const e0 = try world.spawn();
+    try world.addComponent(e0, TestPos, .{ .x = 1, .y = 2 });
+    const src = world.locations.items[e0.index].archetype.?;
+    try world.addComponent(e0, TestVel, .{ .vx = 3, .vy = 4 });
+    const dst = world.locations.items[e0.index].archetype.?;
+
+    // The add edge {Pos} --Vel--> {Pos,Vel} is populated after the first move.
+    try std.testing.expectEqual(dst, src.add_edges[vel_id].?);
+
+    // A second entity taking the same transition lands in the cached target.
+    const e1 = try world.spawn();
+    try world.addComponent(e1, TestPos, .{ .x = 5, .y = 6 });
+    try world.addComponent(e1, TestVel, .{ .vx = 7, .vy = 8 });
+    try std.testing.expectEqual(dst, world.locations.items[e1.index].archetype.?);
+
+    // Removing Vel populates the reverse edge back to {Pos}.
+    try world.removeComponent(e0, TestVel);
+    try std.testing.expectEqual(src, dst.remove_edges[vel_id].?);
+    try std.testing.expectEqual(src, world.locations.items[e0.index].archetype.?);
+}
+
+test "World spawned entities count as changed" {
+    var world = World(TestReg).init(std.testing.allocator);
+    defer world.deinit();
+
+    world.advanceTick();
+    const t_spawn = world.currentTick();
+    _ = try world.spawnWith(.{ TestPos{ .x = 1, .y = 2 }, TestVel{ .vx = 3, .vy = 4 } });
+
+    {
+        var it = world.query(.{ .read = &.{ TestPos, TestVel } });
+        var found = false;
+        while (it.next()) |view| {
+            found = true;
+            try std.testing.expect(view.changedSince(TestPos, t_spawn));
+            try std.testing.expect(view.changedSince(TestVel, t_spawn));
+        }
+        try std.testing.expect(found);
+    }
+
+    // A threshold after the spawn sees no change.
+    world.advanceTick();
+    const t_later = world.currentTick();
+    var it = world.query(.{ .read = &.{TestPos} });
+    while (it.next()) |view| {
+        try std.testing.expect(!view.changedSince(TestPos, t_later));
+    }
+}
+
+test "World addComponent stamps change ticks" {
+    var world = World(TestReg).init(std.testing.allocator);
+    defer world.deinit();
+
+    const e = try world.spawn();
+    try world.addComponent(e, TestPos, .{ .x = 1, .y = 2 });
+
+    // Upsert on a later tick re-stamps the column.
+    world.advanceTick();
+    const t = world.currentTick();
+    try world.addComponent(e, TestPos, .{ .x = 3, .y = 4 });
+
+    var it = world.query(.{ .read = &.{TestPos} });
+    var found = false;
+    while (it.next()) |view| {
+        found = true;
+        try std.testing.expect(view.changedSince(TestPos, t));
+    }
+    try std.testing.expect(found);
+}
+
+test "World archetype move keeps entity visible to change detection" {
+    var world = World(TestReg).init(std.testing.allocator);
+    defer world.deinit();
+
+    const e = try world.spawnWith(.{TestPos{ .x = 1, .y = 2 }});
+
+    world.advanceTick();
+    const t = world.currentTick();
+    // Moving to {Pos,Vel} copies Pos into a chunk of the new archetype; the
+    // copied data must register as changed there.
+    try world.addComponent(e, TestVel, .{ .vx = 3, .vy = 4 });
+
+    var it = world.query(.{ .read = &.{ TestPos, TestVel } });
+    var found = false;
+    while (it.next()) |view| {
+        found = true;
+        try std.testing.expect(view.changedSince(TestPos, t));
+        try std.testing.expect(view.changedSince(TestVel, t));
+    }
+    try std.testing.expect(found);
+}
+
+test "World swap-remove across chunks merges change ticks" {
+    var world = World(TestReg).init(std.testing.allocator);
+    defer world.deinit();
+
+    // Fill one chunk of {Pos} plus one overflow entity in a second chunk.
+    const first = try world.spawnWith(.{TestPos{ .x = 0, .y = 0 }});
+    const cap = world.archetypes.items[0].capacity;
+    var i: usize = 1;
+    while (i < @as(usize, cap) + 1) : (i += 1) {
+        _ = try world.spawnWith(.{TestPos{ .x = @floatFromInt(i), .y = 0 }});
+    }
+    try std.testing.expectEqual(2, world.archetypes.items[0].chunks.items.len);
+
+    // Write only the second (overflow) chunk on a later tick.
+    world.advanceTick();
+    const t = world.currentTick();
+    {
+        var it = world.query(.{ .write = &.{TestPos} });
+        var view_idx: usize = 0;
+        while (it.next()) |view| : (view_idx += 1) {
+            if (view_idx == 1) _ = view.write(TestPos);
+        }
+    }
+
+    // Despawning an entity in chunk 0 swaps the overflow row (recently
+    // written) into chunk 0, whose tick must absorb the newer value.
+    world.despawn(first);
+    var it = world.query(.{ .read = &.{TestPos} });
+    const view = it.next().?;
+    try std.testing.expect(view.changedSince(TestPos, t));
 }
 
 test "World removeComponent to empty" {

@@ -13,6 +13,9 @@ pub const Error = error{
     ComponentCountMismatch,
     UnexpectedEof,
     NotEmpty,
+    /// A structurally invalid field (out-of-range count or index). The input
+    /// is not a well-formed ZCS blob, or was produced by a different build.
+    Corrupt,
 };
 
 /// A bounds-checked cursor over a byte slice for decoding.
@@ -118,22 +121,33 @@ pub fn Serializer(comptime Reg: type) type {
             // ── Entity pool ───────────────────────────────────────────
             const len = try cur.int(u32);
             const alive_count = try cur.int(u32);
+            if (alive_count > len) return Error.Corrupt;
+            // A len the remaining input cannot possibly hold (each generation
+            // is 4 bytes) is structural corruption; reject before allocating.
+            if (len > (bytes.len - cur.pos) / @sizeOf(u32)) return Error.Corrupt;
 
             const pool = &world.entity_pool;
             if (len > 0) {
                 const gens = try allocator.alloc(u32, len);
                 errdefer allocator.free(gens);
                 for (gens) |*g| g.* = try cur.int(u32);
+                if (pool.generations.len > 0) allocator.free(pool.generations);
                 pool.generations = gens;
             }
             pool.len = @intCast(len);
             pool.alive_count = alive_count;
 
             const free_len = try cur.int(u32);
-            try pool.free_list.ensureTotalCapacity(allocator, free_len);
+            if (free_len > len) return Error.Corrupt;
+            // Reserve for every index, not just the serialized free entries:
+            // EntityPool.destroy assumes the free list can absorb any index
+            // without allocating.
+            try pool.free_list.ensureTotalCapacity(allocator, len);
             var fi: u32 = 0;
             while (fi < free_len) : (fi += 1) {
-                pool.free_list.appendAssumeCapacity(@intCast(try cur.int(u32)));
+                const idx = try cur.int(u32);
+                if (idx >= len) return Error.Corrupt;
+                pool.free_list.appendAssumeCapacity(@intCast(idx));
             }
 
             if (len > 0) try world.ensureLocationCapacity(@intCast(len - 1));
@@ -226,6 +240,86 @@ test "serialize round-trip" {
     const reused = try w2.spawn();
     try testing.expectEqual(dead.index, reused.index);
     try testing.expect(!reused.eql(dead));
+}
+
+test "despawn and spawn after deserialize" {
+    const alloc = testing.allocator;
+
+    var w1 = WorldType.init(alloc);
+    defer w1.deinit();
+    const e0 = try w1.spawnWith(.{TestPos{ .x = 1, .y = 2 }});
+    const e1 = try w1.spawnWith(.{TestPos{ .x = 3, .y = 4 }});
+
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(alloc);
+    try Serializer(TestReg).serialize(&w1, alloc, &buf);
+
+    var w2 = WorldType.init(alloc);
+    defer w2.deinit();
+    try Serializer(TestReg).deserialize(&w2, alloc, buf.items);
+
+    // The restored free list must be able to absorb every index: destroy()
+    // appends without allocating.
+    w2.despawn(e0);
+    w2.despawn(e1);
+    try testing.expect(!w2.isAlive(e0));
+    try testing.expect(!w2.isAlive(e1));
+    try testing.expectEqual(0, w2.stats().entity_count);
+
+    // Recycled indices get fresh, non-colliding handles.
+    const reused = try w2.spawn();
+    try testing.expect(w2.isAlive(reused));
+    try testing.expect(!reused.eql(e0) and !reused.eql(e1));
+}
+
+test "deserialize rejects corrupt entity pool fields" {
+    const alloc = testing.allocator;
+
+    var w1 = WorldType.init(alloc);
+    defer w1.deinit();
+    _ = try w1.spawnWith(.{TestPos{ .x = 1, .y = 2 }});
+    const dead = try w1.spawn();
+    w1.despawn(dead);
+
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(alloc);
+    try Serializer(TestReg).serialize(&w1, alloc, &buf);
+
+    // Layout after the 4-byte magic and 4-byte component count:
+    //   len: u32, alive_count: u32, generations: len u32s,
+    //   free_len: u32, free indices: u32 each.
+    const len_off = 8;
+    const alive_off = 12;
+    const free_len_off = alive_off + 4 + 2 * 4; // 2 generations, 4 bytes each (len == 2)
+    const free_idx_off = free_len_off + 4;
+
+    // alive_count > len
+    {
+        var bad = try alloc.dupe(u8, buf.items);
+        defer alloc.free(bad);
+        std.mem.writeInt(u32, bad[alive_off..][0..4], 99, .little);
+        var w = WorldType.init(alloc);
+        defer w.deinit();
+        try testing.expectError(Error.Corrupt, Serializer(TestReg).deserialize(&w, alloc, bad));
+    }
+    // free index out of range
+    {
+        var bad = try alloc.dupe(u8, buf.items);
+        defer alloc.free(bad);
+        std.mem.writeInt(u32, bad[free_idx_off..][0..4], 7, .little);
+        var w = WorldType.init(alloc);
+        defer w.deinit();
+        try testing.expectError(Error.Corrupt, Serializer(TestReg).deserialize(&w, alloc, bad));
+    }
+    // len larger than the input could possibly hold (truncated generations)
+    {
+        var bad = try alloc.dupe(u8, buf.items);
+        defer alloc.free(bad);
+        std.mem.writeInt(u32, bad[len_off..][0..4], std.math.maxInt(u32), .little);
+        var w = WorldType.init(alloc);
+        defer w.deinit();
+        try testing.expectError(Error.Corrupt, Serializer(TestReg).deserialize(&w, alloc, bad));
+    }
 }
 
 test "deserialize rejects a non-empty world" {

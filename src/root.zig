@@ -5,6 +5,7 @@ pub const EntityPool = @import("entity.zig").EntityPool;
 pub const ChunkPool = @import("chunk_pool.zig").ChunkPool;
 pub const Chunk = @import("chunk_pool.zig").Chunk;
 pub const chunk_data_size = @import("chunk_pool.zig").chunk_data_size;
+pub const chunk_align = @import("chunk_pool.zig").chunk_align;
 pub const Resources = @import("resources.zig").Resources;
 pub const DeltaTime = @import("resources.zig").DeltaTime;
 pub const FrameCount = @import("resources.zig").FrameCount;
@@ -26,16 +27,29 @@ pub fn SparseSet(comptime V: type) type {
 pub fn Registry(comptime component_types: []const type) type {
     const count = component_types.len;
 
-    // Reject any single component that cannot fit in a chunk alongside an
-    // entity row. The archetype layout shrinks capacity to fit the combined
-    // stride of a mask, but a single oversized component is unrecoverable and
-    // would otherwise corrupt the heap at runtime.
+    // Reject component sets the chunk layout cannot represent:
+    // - a single component that cannot fit in a chunk alongside an entity row
+    //   (the layout shrinks capacity for a combined stride, but one oversized
+    //   component is unrecoverable and would corrupt the heap at runtime);
+    // - alignment above the chunk block's alignment (columns would be
+    //   misaligned at runtime);
+    // - duplicate types (only the first would ever be addressable by id()).
     comptime {
         const EID = @import("entity.zig").EntityID;
-        for (component_types) |T| {
+        for (component_types, 0..) |T, i| {
             if (@sizeOf(EID) + @sizeOf(T) > chunk_data_size) {
                 @compileError("Component " ++ @typeName(T) ++ " is too large to fit in a " ++
                     std.fmt.comptimePrint("{d}", .{chunk_data_size}) ++ "-byte chunk");
+            }
+            if (@sizeOf(T) > 0 and @alignOf(T) > chunk_align) {
+                @compileError("Component " ++ @typeName(T) ++ " requires alignment " ++
+                    std.fmt.comptimePrint("{d}", .{@alignOf(T)}) ++ ", above the chunk alignment of " ++
+                    std.fmt.comptimePrint("{d}", .{chunk_align}));
+            }
+            for (component_types[0..i]) |U| {
+                if (T == U) {
+                    @compileError("Duplicate component type " ++ @typeName(T) ++ " in Registry");
+                }
             }
         }
     }
@@ -91,7 +105,6 @@ pub fn Registry(comptime component_types: []const type) type {
         pub const World = @import("world.zig").World(@This());
         pub const CommandBuffer = @import("command_buffer.zig").CommandBuffer(@This());
         pub const Schedule = @import("schedule.zig").Schedule(@This());
-        pub const Events = @import("events.zig").Events(@This());
         pub const Parallel = @import("parallel.zig").Parallel(@This());
         pub const Serialize = @import("serialize.zig").Serializer(@This());
     };
@@ -106,7 +119,6 @@ test {
     _ = @import("command_buffer.zig");
     _ = @import("resources.zig");
     _ = @import("schedule.zig");
-    _ = @import("events.zig");
     _ = @import("parallel.zig");
     _ = @import("sparse_set.zig");
     _ = @import("serialize.zig");

@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     container: jackpar/zig:0.16.0
 
@@ -15,5 +15,17 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Build project
+    - name: Check formatting
+      run: zig fmt --check build.zig src examples
+
+    - name: Test (Debug)
       run: zig build test --summary all
+
+    - name: Test (ReleaseSafe)
+      run: zig build test --summary all -Doptimize=ReleaseSafe
+
+    - name: Test (ReleaseFast)
+      run: zig build test --summary all -Doptimize=ReleaseFast
+
+    - name: Build example and benchmark
+      run: zig build --summary all

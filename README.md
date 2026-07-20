@@ -15,8 +15,8 @@ Designed for the [Zephyr Game Engine](https://github.com/Zephyr-Engine) but full
 - **Cached queries** — matching archetype lists are cached per query shape and rebuilt only when a new archetype appears.
 - **Swap-remove deletion** — O(1) unordered entity removal with automatic back-fill from the last slot.
 - **CommandBuffer** — deferred structural mutations (spawn, spawnWith, despawn, add/remove component) safe to use during iteration.
-- **Parallel chunk dispatch** — `Parallel.forEachChunk` spreads a system across a `ThreadPool`, one chunk per task (disjoint memory, data-race free).
-- **Change detection** — per-chunk/per-component write ticks; `view.changedSince(T, tick)` skips unmodified data.
+- **Parallel chunk dispatch** — `Parallel.forEachChunk` spreads a system across a persistent `ThreadPool` (workers parked on a `std.Io` futex between dispatches), one chunk per task (disjoint memory, data-race free).
+- **Change detection** — per-chunk/per-component write ticks; `view.changedSince(T, tick)` skips unmodified data. Spawns and archetype moves count as changes, so new data is never skipped.
 - **Schedule** — phased system execution (pre_update, update, post_update, render) with automatic CommandBuffer flushing, delta-time, and frame counting (`tickDt`).
 - **Resources** — world-owned, type-erased singleton storage for global game state (delta time, frame count, etc.), readable from any system.
 - **Lifecycle observers** — opt-in `on_spawn`/`on_despawn`/`on_add`/`on_remove` callbacks with near-zero cost when unused.

@@ -4,83 +4,151 @@ const world_mod = @import("world.zig");
 const cmd_mod = @import("command_buffer.zig");
 const query_mod = @import("query.zig");
 
-/// A worker pool for data-parallel `for` loops over a fixed index range.
+const Io = std.Io;
+
+/// A persistent worker pool for data-parallel `for` loops over a fixed index
+/// range.
 ///
-/// `std` 0.16 dropped `std.Thread.Pool` and moved the blocking sync primitives
-/// (Mutex/Condition) behind the `std.Io` interface, so this is a self-contained
-/// implementation built on just `std.Thread` + atomics. Each `dispatch` spawns
-/// helper threads that, together with the calling thread, drain a shared atomic
-/// cursor; completion is detected by `join`. The owner always participates, so
-/// the work completes correctly even if thread spawning fails.
+/// Worker threads are spawned once at `init` and parked on a condition
+/// variable between dispatches — `dispatch` only wakes them, it never spawns
+/// threads. `std` 0.16 moved the blocking sync primitives behind the
+/// `std.Io` interface, so the pool takes an `Io` at init (e.g. from
+/// `std.Io.Threaded`) and uses its futex for parking.
 ///
-/// Note: this spawns/joins helper threads per dispatch. That is fine for coarse,
-/// heavy systems; a persistent `std.Io`-backed pool would lower the per-dispatch
-/// overhead for very fine-grained work (a natural future `zob` integration point).
+/// The pool must not be moved after `init` (workers hold a pointer to it).
+/// The owner always participates in draining, so work completes even if some
+/// or all worker spawns failed.
 pub const ThreadPool = struct {
     const RunFn = *const fn (*anyopaque, usize) void;
 
-    const Shared = struct {
-        run_fn: RunFn,
-        ctx: *anyopaque,
-        total: usize,
-        cursor: std.atomic.Value(usize),
-    };
+    io: Io,
+    allocator: Allocator,
+    /// Backing storage for helper threads; only `threads[0..spawned]` are live.
+    threads: []std.Thread,
+    spawned: usize,
+    mutex: Io.Mutex,
+    work_cond: Io.Condition,
+    done_cond: Io.Condition,
+    /// Bumped once per dispatch so parked workers can tell a new job from a
+    /// spurious wakeup. Guarded by `mutex`, like all fields below except
+    /// `cursor` (which workers drain lock-free).
+    epoch: u64,
+    run_fn: RunFn,
+    ctx: *anyopaque,
+    total: usize,
+    cursor: std.atomic.Value(usize),
+    /// Helper threads still draining the current job.
+    pending: usize,
+    stop: bool,
 
-    /// Scratch storage for helper threads (length = workerCount - 1).
-    threads: []std.Thread = &.{},
-    allocator: Allocator = undefined,
-
-    /// Initialize the pool. `thread_count` of 0 uses the detected CPU count.
-    pub fn init(self: *ThreadPool, allocator: Allocator, thread_count: usize) !void {
+    /// Initialize the pool and spawn its workers. `thread_count` of 0 uses
+    /// the detected CPU count. Worker spawning is best effort: on failure the
+    /// pool simply runs with fewer helpers.
+    pub fn init(self: *ThreadPool, allocator: Allocator, io: Io, thread_count: usize) !void {
         const n = if (thread_count != 0) thread_count else (std.Thread.getCpuCount() catch 1);
         const helpers = if (n > 0) n - 1 else 0;
         self.* = .{
-            .threads = try allocator.alloc(std.Thread, helpers),
+            .io = io,
             .allocator = allocator,
+            .threads = try allocator.alloc(std.Thread, helpers),
+            .spawned = 0,
+            .mutex = .init,
+            .work_cond = .init,
+            .done_cond = .init,
+            .epoch = 0,
+            .run_fn = undefined,
+            .ctx = undefined,
+            .total = 0,
+            .cursor = std.atomic.Value(usize).init(0),
+            .pending = 0,
+            .stop = false,
         };
+        for (self.threads) |*t| {
+            t.* = std.Thread.spawn(.{}, workerMain, .{self}) catch break;
+            self.spawned += 1;
+        }
     }
 
     pub fn deinit(self: *ThreadPool) void {
+        const io = self.io;
+        if (self.spawned > 0) {
+            self.mutex.lockUncancelable(io);
+            self.stop = true;
+            self.work_cond.broadcast(io);
+            self.mutex.unlock(io);
+            for (self.threads[0..self.spawned]) |t| t.join();
+        }
         self.allocator.free(self.threads);
-        self.threads = &.{};
+        self.* = undefined;
     }
 
     /// Total number of logical workers (helper threads + the calling thread).
     pub fn workerCount(self: *const ThreadPool) usize {
-        return self.threads.len + 1;
+        return self.spawned + 1;
     }
 
-    fn drain(shared: *Shared) void {
+    fn drain(run_fn: RunFn, ctx: *anyopaque, total: usize, cursor: *std.atomic.Value(usize)) void {
         while (true) {
-            const i = shared.cursor.fetchAdd(1, .monotonic);
-            if (i >= shared.total) break;
-            shared.run_fn(shared.ctx, i);
+            const i = cursor.fetchAdd(1, .monotonic);
+            if (i >= total) break;
+            run_fn(ctx, i);
         }
+    }
+
+    fn workerMain(self: *ThreadPool) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        var seen: u64 = 0;
+        while (true) {
+            while (!self.stop and self.epoch == seen) {
+                self.work_cond.waitUncancelable(io, &self.mutex);
+            }
+            if (self.stop) break;
+            seen = self.epoch;
+            const run_fn = self.run_fn;
+            const ctx = self.ctx;
+            const total = self.total;
+            self.mutex.unlock(io);
+
+            drain(run_fn, ctx, total, &self.cursor);
+
+            self.mutex.lockUncancelable(io);
+            self.pending -= 1;
+            if (self.pending == 0) self.done_cond.signal(io);
+        }
+        self.mutex.unlock(io);
     }
 
     /// Run `run_fn(ctx, i)` for every `i` in `[0, total)`, distributing indices
-    /// across the pool. Blocks until all indices have been processed.
+    /// across the pool. Blocks until all indices have been processed. Must only
+    /// be called from the owning thread; dispatches never overlap.
     pub fn dispatch(self: *ThreadPool, run_fn: RunFn, ctx: *anyopaque, total: usize) void {
         if (total == 0) return;
+        const io = self.io;
 
-        var shared = Shared{
-            .run_fn = run_fn,
-            .ctx = ctx,
-            .total = total,
-            .cursor = std.atomic.Value(usize).init(0),
-        };
-
-        // Spawn helper threads (best effort). If a spawn fails, the owner still
-        // drains every remaining index, so the result is always complete.
-        var spawned: usize = 0;
-        for (self.threads) |*t| {
-            t.* = std.Thread.spawn(.{}, drain, .{&shared}) catch break;
-            spawned += 1;
+        if (self.spawned > 0) {
+            self.mutex.lockUncancelable(io);
+            self.run_fn = run_fn;
+            self.ctx = ctx;
+            self.total = total;
+            self.cursor.store(0, .monotonic);
+            self.pending = self.spawned;
+            self.epoch += 1;
+            self.work_cond.broadcast(io);
+            self.mutex.unlock(io);
+        } else {
+            self.cursor.store(0, .monotonic);
         }
 
-        drain(&shared); // owner participates
+        drain(run_fn, ctx, total, &self.cursor); // owner participates
 
-        for (self.threads[0..spawned]) |t| t.join();
+        if (self.spawned > 0) {
+            // Wait for helpers still mid-item; afterwards every worker is
+            // parked again and the job state may be reused.
+            self.mutex.lockUncancelable(io);
+            while (self.pending != 0) self.done_cond.waitUncancelable(io, &self.mutex);
+            self.mutex.unlock(io);
+        }
     }
 };
 
@@ -190,8 +258,11 @@ test "ThreadPool dispatch covers every index" {
     defer allocator.free(counts);
     for (counts) |*c| c.* = std.atomic.Value(u32).init(0);
 
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
     var pool: ThreadPool = undefined;
-    try pool.init(allocator, 4);
+    try pool.init(allocator, threaded.io(), 4);
     defer pool.deinit();
 
     const Job = struct {
@@ -223,8 +294,11 @@ test "Parallel forEachChunk processes all entities" {
         _ = try world.spawnWith(.{TestPos{ .x = fx, .y = 0 }});
     }
 
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
     var pool: ThreadPool = undefined;
-    try pool.init(allocator, 4);
+    try pool.init(allocator, threaded.io(), 4);
     defer pool.deinit();
 
     try Parallel(TestReg).forEachChunk(&pool, &world, .{ .write = &.{TestPos} }, {}, struct {

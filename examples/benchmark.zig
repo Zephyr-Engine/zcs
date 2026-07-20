@@ -305,7 +305,7 @@ fn benchCommandBuffer(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchRe
     return .{ .name = "command buffer spawn+flush", .total_ns = total_ns, .iters = cfg.iters, .entity_count = cfg.entity_count };
 }
 
-// A deliberately heavy per-entity workload, so thread-spawn overhead is
+// A deliberately heavy per-entity workload, so dispatch overhead is
 // amortized and the parallel speedup is visible.
 fn heavyWork(positions: []Position, velocities: []const Velocity) void {
     for (positions, velocities) |*pos, vel| {
@@ -352,7 +352,7 @@ fn benchHeavyPar(allocator: std.mem.Allocator, io: Io, cfg: Config) BenchResult 
     seedHeavyWorld(&world, cfg.entity_count);
 
     var pool: zcs.ThreadPool = undefined;
-    pool.init(allocator, 0) catch unreachable;
+    pool.init(allocator, io, 0) catch unreachable;
     defer pool.deinit();
 
     var total_ns: i96 = 0;

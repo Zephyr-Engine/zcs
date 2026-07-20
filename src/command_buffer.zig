@@ -50,7 +50,11 @@ pub fn CommandBuffer(comptime Reg: type) type {
             self.commands.deinit(self.world.allocator);
         }
 
-        /// Spawn a new entity. Returns the EntityID immediately.
+        /// Spawn a new entity. Returns the EntityID immediately (the id is
+        /// allocated eagerly so later commands can reference it).
+        ///
+        /// Note: the `on_spawn` observer fires here, before the entity has
+        /// any components — deferred component adds land at `flush`.
         pub fn spawn(self: *Self) !EntityID {
             const id = try self.world.entity_pool.create();
             try self.world.ensureLocationCapacity(id.index);
@@ -63,6 +67,9 @@ pub fn CommandBuffer(comptime Reg: type) type {
         /// Spawn a new entity with a full component bundle. Returns the
         /// EntityID immediately; the entity is placed into its final archetype
         /// in a single append at flush time (no per-component moves).
+        ///
+        /// As with `spawn`, `on_spawn` fires here — before the bundle's
+        /// components exist on the entity.
         pub fn spawnWith(self: *Self, components: anytype) !EntityID {
             const fields = switch (@typeInfo(@TypeOf(components))) {
                 .@"struct" => |s| s.fields,
@@ -147,7 +154,8 @@ pub fn CommandBuffer(comptime Reg: type) type {
             });
         }
 
-        /// Apply all queued commands to the world, then reset.
+        /// Apply all queued commands to the world in the order they were
+        /// queued, then reset.
         pub fn flush(self: *Self) !void {
             for (self.commands.items) |cmd| {
                 switch (cmd) {
